@@ -12,23 +12,21 @@ import (
 
 var (
 	ErrorBlock           = stderrors.New("forbidden")
-	ErrorWarning         = stderrors.New("too many requests")
 	ErrorWhiteListExists = stderrors.New("whiteList exists")
-	ErrorBlackListExists = stderrors.New("blackList exists")
+	ErrorBlockListExists = stderrors.New("blockList exists")
 )
 
 type Config struct {
 	Name          string
 	Duration      time.Duration
-	WarningTimes  int
 	BlockTimes    int
 	BlockDuration time.Duration //0=ever
-	WarningError  error
 	BlockError    error
-	Store         *redis.Redis
+	Redis         *redis.Redis
 	WhiteList     []string
-	BlackList     []string
+	BlockList     []string
 	Pub           func(string, string) error
+	CustomHandler func(int) error
 }
 
 func NewWithConfig(conf *config.Config, c *Config) *RateLimiter {
@@ -53,22 +51,19 @@ func New(c *Config) *RateLimiter {
 	if c.BlockError == nil {
 		c.BlockError = ErrorBlock
 	}
-	if c.WarningError == nil {
-		c.WarningError = ErrorWarning
-	}
 
 	rl := RateLimiter{
 		Config: c,
 	}
 	rl.whiteListKey = rl.Name + "-white"
-	rl.blackListKey = rl.Name + "-black"
+	rl.blockListKey = rl.Name + "-block"
 	for _, val := range c.WhiteList {
 		rl.whiteList = append(rl.whiteList, val)
 	}
-	for _, val := range c.BlackList {
-		rl.blackList = append(rl.blackList, val)
+	for _, val := range c.BlockList {
+		rl.blockList = append(rl.blockList, val)
 	}
-	whiteList, err := rl.Store.SMembers(context.Background(), rl.whiteListKey).Result()
+	whiteList, err := rl.Redis.SMembers(context.Background(), rl.whiteListKey).Result()
 	if err == nil {
 		for _, val := range whiteList {
 			if !funk.ContainsString(rl.whiteList, val) {
@@ -76,11 +71,11 @@ func New(c *Config) *RateLimiter {
 			}
 		}
 	}
-	blackList, err := rl.Store.SMembers(context.Background(), rl.blackListKey).Result()
+	blockList, err := rl.Redis.SMembers(context.Background(), rl.blockListKey).Result()
 	if err == nil {
-		for _, val := range blackList {
-			if !funk.ContainsString(rl.blackList, val) {
-				rl.blackList = append(rl.blackList, val)
+		for _, val := range blockList {
+			if !funk.ContainsString(rl.blockList, val) {
+				rl.blockList = append(rl.blockList, val)
 			}
 		}
 	}
@@ -90,41 +85,43 @@ func New(c *Config) *RateLimiter {
 type RateLimiter struct {
 	*Config
 	whiteList    []string
-	blackList    []string
+	blockList    []string
 	whiteListKey string
-	blackListKey string
+	blockListKey string
 }
 
 func (rl *RateLimiter) Check(id string) (int, error) {
 	if funk.Contains(rl.whiteList, id) {
 		return 0, nil
 	}
-
-	if funk.Contains(rl.blackList, id) {
+	if funk.Contains(rl.blockList, id) {
 		return 0, rl.BlockError
 	}
 
-	times, err := rl.Store.FrequencyLimit(context.Background(), rl.Name+":"+id, 0, rl.Duration)
+	ctx := context.Background()
+	times, err := rl.Redis.FrequencyLimit(ctx, rl.Name+":"+id, rl.BlockTimes, rl.Duration)
 	if err != nil {
+		if err.Error() == "reach limit" {
+			return 0, rl.BlockError
+		}
 		return 0, err
 	}
-
 	if rl.BlockTimes > 0 && times >= rl.BlockTimes {
 		if rl.BlockDuration == 0 {
-			rl.AddBlackList(id, true)
+			rl.AddBlockList(id, true)
 		} else {
-			rl.Store.Expire(context.Background(), rl.Name+":"+id, rl.BlockDuration)
+			rl.Redis.Expire(ctx, rl.Name+":"+id, rl.BlockDuration)
 		}
 		return times, rl.BlockError
-	} else if rl.WarningTimes > 0 && times >= rl.WarningTimes {
-		return times, rl.WarningError
 	}
-
+	if rl.CustomHandler != nil {
+		return times, rl.CustomHandler(times)
+	}
 	return times, nil
 }
 
 func (rl *RateLimiter) CheckReset(id string) error {
-	_, err := rl.Store.Del(context.Background(), rl.Name+":"+id).Result()
+	_, err := rl.Redis.Del(context.Background(), rl.Name+":"+id).Result()
 	return err
 }
 
@@ -134,21 +131,21 @@ func (rl *RateLimiter) Sub(message string) error {
 		return nil
 	}
 	switch str[0] {
-	case "removeWhiteList":
+	case "rw":
 		return rl.RemoveWhiteList(str[1], false)
-	case "removeBlackList":
-		return rl.RemoveBlackList(str[1], false)
-	case "addWhiteList":
+	case "rb":
+		return rl.RemoveBlockList(str[1], false)
+	case "aw":
 		return rl.AddWhiteList(str[1], false)
-	case "addBlackList":
-		return rl.AddBlackList(str[1], false)
+	case "ab":
+		return rl.AddBlockList(str[1], false)
 	default:
 		return nil
 	}
 }
 
 func (rl *RateLimiter) RemoveWhiteList(id string, pub bool) error {
-	_, err := rl.Store.SRem(context.Background(), rl.whiteListKey, id).Result()
+	_, err := rl.Redis.SRem(context.Background(), rl.whiteListKey, id).Result()
 	if err != nil {
 		return err
 	}
@@ -157,55 +154,54 @@ func (rl *RateLimiter) RemoveWhiteList(id string, pub bool) error {
 		rl.whiteList = append(rl.whiteList[:idx], rl.whiteList[idx+1:]...)
 	}
 	if pub && rl.Pub != nil {
-		rl.Pub(rl.Name, "removeWhiteList-"+id)
+		rl.Pub(rl.Name, "rw-"+id)
 	}
 	return nil
 }
 
-func (rl *RateLimiter) RemoveBlackList(id string, pub bool) error {
-	_, err := rl.Store.SRem(context.Background(), rl.blackListKey, id).Result()
+func (rl *RateLimiter) RemoveBlockList(id string, pub bool) error {
+	_, err := rl.Redis.SRem(context.Background(), rl.blockListKey, id).Result()
 	if err != nil {
 		return err
 	}
-	idx := funk.IndexOfString(rl.blackList, id)
+	idx := funk.IndexOfString(rl.blockList, id)
 	if idx != -1 {
-		rl.blackList = append(rl.blackList[:idx], rl.blackList[idx+1:]...)
+		rl.blockList = append(rl.blockList[:idx], rl.blockList[idx+1:]...)
 	}
 	if pub && rl.Pub != nil {
-		rl.Pub(rl.Name, "removeBlackList-"+id)
+		rl.Pub(rl.Name, "rb-"+id)
 	}
 	return rl.CheckReset(id)
 }
 
 func (rl *RateLimiter) AddWhiteList(id string, pub bool) error {
-	_, err := rl.Store.SAdd(context.Background(), rl.whiteListKey, id).Result()
+	rl.whiteList = append(rl.whiteList, id)
+	_, err := rl.Redis.SAdd(context.Background(), rl.whiteListKey, id).Result()
 	if err != nil {
 		return err
 	}
-
 	idx := funk.IndexOfString(rl.whiteList, id)
 	if idx != -1 {
 		return ErrorWhiteListExists
 	}
-	rl.whiteList = append(rl.whiteList, id)
 	if pub && rl.Pub != nil {
-		rl.Pub(rl.Name, "addWhiteList-"+id)
+		rl.Pub(rl.Name, "aw-"+id)
 	}
 	return nil
 }
 
-func (rl *RateLimiter) AddBlackList(id string, pub bool) error {
-	_, err := rl.Store.SAdd(context.Background(), rl.blackListKey, id).Result()
+func (rl *RateLimiter) AddBlockList(id string, pub bool) error {
+	rl.blockList = append(rl.blockList, id)
+	_, err := rl.Redis.SAdd(context.Background(), rl.blockListKey, id).Result()
 	if err != nil {
 		return err
 	}
-	idx := funk.IndexOfString(rl.blackList, id)
+	idx := funk.IndexOfString(rl.blockList, id)
 	if idx != -1 {
-		return ErrorBlackListExists
+		return ErrorBlockListExists
 	}
-	rl.blackList = append(rl.blackList, id)
 	if pub && rl.Pub != nil {
-		rl.Pub(rl.Name, "addBlackList-"+id)
+		rl.Pub(rl.Name, "ab-"+id)
 	}
 	return nil
 }
@@ -222,14 +218,14 @@ func (rl *RateLimiter) GetWhiteList(id interface{}) ([]string, error) {
 	return rl.whiteList, nil
 }
 
-func (rl *RateLimiter) GetBlackList(id interface{}) ([]string, error) {
+func (rl *RateLimiter) GetBlockList(id interface{}) ([]string, error) {
 	if id != nil {
-		has := funk.ContainsString(rl.blackList, id.(string))
+		has := funk.ContainsString(rl.blockList, id.(string))
 		if has {
 			return []string{id.(string)}, nil
 		} else {
 			return nil, nil
 		}
 	}
-	return rl.blackList, nil
+	return rl.blockList, nil
 }
